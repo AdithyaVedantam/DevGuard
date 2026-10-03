@@ -1,0 +1,13 @@
+{
+  "name": "devguard-demo",
+  "version": "1.0.0",
+  "dependencies": {
+    "lodash": "4.17.21",
+    "minimist": "1.2.5",
+    "mkdirp": "1.0.4"
+  },
+  "devDependencies": {
+    "minimatch": "3.1.2"
+  },
+  "description": "DevGuard demo fixture - real package versions, no code"
+}
