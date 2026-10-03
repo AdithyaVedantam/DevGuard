@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DevGuard — Dependency Security Analytics</title>
+  <!-- Tailwind + Chart.js come from CDNs, so there is nothing to install or build for the frontend. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style type="text/tailwindcss">
+    @layer components {
+      .card { @apply rounded-xl border border-slate-800 bg-slate-900/70 p-5; }
+      .btn { @apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed; }
+      .btn-primary { @apply bg-teal-400 text-slate-950 hover:brightness-110; }
+      .btn-ghost { @apply border border-slate-700 text-slate-200 hover:bg-slate-800; }
+      .input { @apply w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-teal-400; }
+      .th { @apply px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-slate-400; }
+      .td { @apply px-3 py-2.5 text-sm; }
+      .pill { @apply rounded-md border border-slate-700 px-2 py-0.5 text-[11px] text-slate-400; }
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-200 antialiased">
+  <div id="app" class="mx-auto max-w-6xl px-5 pb-20"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
