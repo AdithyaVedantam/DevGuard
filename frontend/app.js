@@ -184,6 +184,10 @@ function overview(el, data) {
 }
 
 // ---------- vulnerabilities ----------
+const SEVRANK = { critical: 4, high: 3, medium: 2, low: 1, unknown: 0 };
+const verKey = (v) => String(v).split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+const cmpVer = (a, b) => { const x = verKey(a), y = verKey(b); for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d; } return 0; };
+
 async function vulnsTab(el, s) {
   el.innerHTML = spinner("Loading vulnerabilities…");
   let rows; try { rows = (await api(`/api/scans/${s.id}/findings`)).findings; } catch (e) { el.innerHTML = errBox(e); return; }
@@ -192,17 +196,46 @@ async function vulnsTab(el, s) {
     <select id="fType" class="input w-auto"><option value="">Direct &amp; transitive</option><option>direct</option><option>transitive</option></select>
     <select id="fEnv" class="input w-auto"><option value="">Prod &amp; dev</option><option>production</option><option>development</option></select>
     <select id="fFix" class="input w-auto"><option value="">Fix: any</option><option value="yes">Fix available</option><option value="no">No fix known</option></select>
+    <select id="fView" class="input w-auto"><option value="group">View: grouped by package</option><option value="flat">View: every advisory</option></select>
     <a class="btn btn-ghost" href="/api/scans/${s.id}/export.csv">Export CSV</a></div>
     <div id="vTable"></div><p id="vCount" class="mt-2 text-xs text-slate-500"></p>`;
+  const head = `<thead class="border-b border-slate-800"><tr><th class="th">Package</th><th class="th">Version</th><th class="th">Severity</th><th class="th">CVSS</th><th class="th">Advisory</th><th class="th">Type</th><th class="th">Env</th><th class="th">Fixed in</th></tr></thead>`;
+  const cvssCell = (c, tip) => `<td class="td tabular-nums" title="${tip}">${c === null || c < 0 ? "—" : Number(c).toFixed(1)}</td>`;
+  const flatRow = (r, extra = "") => `<tr class="cursor-pointer hover:bg-slate-800/60 ${extra}" data-id="${r.id}"><td class="td font-mono">${esc(r.package)}</td><td class="td font-mono text-slate-400">${esc(r.version)}</td><td class="td">${badge(r.severity)}</td>${cvssCell(r.cvss, r.cvss === null ? "OSV provided only a severity label for this advisory" : "CVSS v3 base score")}<td class="td"><div class="font-mono text-xs text-teal-300">${esc(r.osv_id)}</div><div class="max-w-xs truncate text-xs text-slate-500">${esc(r.summary)}</div></td><td class="td text-slate-400">${esc(r.dep_type)}</td><td class="td text-slate-400">${r.env === "production" ? "prod" : "dev"}</td><td class="td font-mono">${r.fixed_version ? esc(r.fixed_version) : "—"}</td></tr>`;
+
   const draw = () => {
     const q = $("#q").value.toLowerCase(), sev = $("#fSev").value, ty = $("#fType").value, env = $("#fEnv").value, fix = $("#fFix").value;
+    const grouped = $("#fView").value === "group";
     const list = rows.filter((r) => (!q || r.package.toLowerCase().includes(q) || r.osv_id.toLowerCase().includes(q)) && (!sev || r.severity === sev) && (!ty || r.dep_type === ty) && (!env || r.env === env) && (!fix || (fix === "yes") === !!r.fixed_version));
-    $("#vCount").textContent = `${list.length} result(s). Click a row for details and the dependency path.`;
-    $("#vTable").innerHTML = list.length ? `<div class="card overflow-x-auto p-0"><table class="w-full"><thead class="border-b border-slate-800"><tr><th class="th">Package</th><th class="th">Version</th><th class="th">Severity</th><th class="th">CVSS</th><th class="th">Advisory</th><th class="th">Type</th><th class="th">Env</th><th class="th">Fixed in</th></tr></thead><tbody class="divide-y divide-slate-800">${list.map((r) => `<tr class="cursor-pointer hover:bg-slate-800/60" data-id="${r.id}"><td class="td font-mono">${esc(r.package)}</td><td class="td font-mono text-slate-400">${esc(r.version)}</td><td class="td">${badge(r.severity)}</td><td class="td tabular-nums" title="${r.cvss === null ? "OSV provided only a severity label for this advisory" : "CVSS v3 base score"}">${r.cvss === null ? "—" : Number(r.cvss).toFixed(1)}</td><td class="td"><div class="font-mono text-xs text-teal-300">${esc(r.osv_id)}</div><div class="max-w-xs truncate text-xs text-slate-500">${esc(r.summary)}</div></td><td class="td text-slate-400">${esc(r.dep_type)}</td><td class="td text-slate-400">${r.env === "production" ? "prod" : "dev"}</td><td class="td font-mono">${r.fixed_version ? esc(r.fixed_version) : "—"}</td></tr>`).join("")}</tbody></table></div>`
-      : empty("No vulnerabilities match.", rows.length ? "Try clearing a filter." : "None found. If the scan was partial or failed, that is not proof of safety.");
+    if (!list.length) { $("#vTable").innerHTML = empty("No vulnerabilities match.", rows.length ? "Try clearing a filter." : "None found. If the scan was partial or failed, that is not proof of safety."); $("#vCount").textContent = ""; return; }
+    let body;
+    if (!grouped) {
+      body = list.map((r) => flatRow(r)).join("");
+      $("#vCount").textContent = `${list.length} advisories. Click a row for details and the dependency path.`;
+    } else {
+      const groups = new Map();
+      list.forEach((r) => { const k = r.package + "@" + r.version; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); });
+      const arr = [...groups.values()].map((items) => {
+        const fixes = items.map((i) => i.fixed_version).filter(Boolean);
+        return { items, worst: items.reduce((w, i) => (SEVRANK[i.severity] > SEVRANK[w] ? i.severity : w), "unknown"),
+          maxCvss: Math.max(...items.map((i) => (i.cvss === null ? -1 : i.cvss))),
+          upgrade: fixes.length ? fixes.reduce((a, b) => (cmpVer(a, b) >= 0 ? a : b)) : null, unfixed: items.length - fixes.length };
+      }).sort((a, b) => SEVRANK[b.worst] - SEVRANK[a.worst] || b.items.length - a.items.length);
+      body = arr.map((g, i) => { const f = g.items[0];
+        return `<tr class="cursor-pointer bg-slate-900 hover:bg-slate-800" data-g="${i}"><td class="td font-mono"><span class="chev text-slate-500">▸</span> ${esc(f.package)}</td><td class="td font-mono text-slate-400">${esc(f.version)}</td><td class="td">${badge(g.worst)}</td>${cvssCell(g.maxCvss, "Highest CVSS among this package's advisories")}<td class="td"><b>${g.items.length}</b> vulnerabilit${g.items.length === 1 ? "y" : "ies"}${g.unfixed ? ` <span class="text-orange-300">· ${g.unfixed} with no known fix</span>` : ""}</td><td class="td text-slate-400">${esc(f.dep_type)}</td><td class="td text-slate-400">${f.env === "production" ? "prod" : "dev"}</td><td class="td font-mono text-teal-300" title="Upgrading to this version or newer fixes every advisory listed that has a known fix">${g.upgrade ? "≥ " + esc(g.upgrade) : "—"}</td></tr>`
+          + g.items.map((r) => flatRow(r, "hidden").replace("<tr ", `<tr data-gc="${i}" `)).join(""); }).join("");
+      $("#vCount").textContent = `${list.length} advisories in ${arr.length} packages. Click a package to expand it; "Fixed in ≥" is the upgrade that fixes all of its listed advisories.`;
+    }
+    $("#vTable").innerHTML = `<div class="card overflow-x-auto p-0"><table class="w-full">${head}<tbody class="divide-y divide-slate-800">${body}</tbody></table></div>`;
     document.querySelectorAll("#vTable tr[data-id]").forEach((tr) => (tr.onclick = () => toggleDetail(tr, 8)));
+    document.querySelectorAll("#vTable tr[data-g]").forEach((tr) => (tr.onclick = () => {
+      const kids = document.querySelectorAll(`#vTable tr[data-gc="${tr.dataset.g}"]`);
+      const open = kids.length && !kids[0].classList.contains("hidden");
+      kids.forEach((k) => { k.classList.toggle("hidden", !!open); if (open && k.nextElementSibling && k.nextElementSibling.dataset.detail) k.nextElementSibling.remove(); });
+      tr.querySelector(".chev").textContent = open ? "▸" : "▾";
+    }));
   };
-  ["q", "fSev", "fType", "fEnv", "fFix"].forEach((id) => ($("#" + id).oninput = draw));
+  ["q", "fSev", "fType", "fEnv", "fFix", "fView"].forEach((id) => ($("#" + id).oninput = draw));
   draw();
 }
 
@@ -214,7 +247,7 @@ async function toggleDetail(tr, cols) {
   try {
     const f = await api(`/api/findings/${tr.dataset.id}`);
     row.firstElementChild.innerHTML = `<div class="grid gap-4 text-sm md:grid-cols-2">
-      <div><div class="flex flex-wrap items-center gap-2">${badge(f.severity)}${f.cvss !== null ? `<span class="pill">CVSS ${f.cvss}</span>` : ""}<b class="font-mono text-white">${esc(f.osv_id)}</b></div>
+      <div><div class="flex flex-wrap items-center gap-2">${badge(f.severity)}${f.cvss !== null ? `<span class="pill">CVSS ${Number(f.cvss).toFixed(1)}</span>` : ""}<b class="font-mono text-white">${esc(f.osv_id)}</b></div>
         ${f.aliases.length ? `<div class="mt-1 text-xs text-slate-500">Also: ${f.aliases.map(esc).join(", ")}</div>` : ""}
         <p class="mt-2 text-slate-300">${esc(f.summary || "No summary provided by OSV.")}</p>
         <dl class="mt-3 grid grid-cols-2 gap-2 text-xs"><div><dt class="text-slate-500">Installed</dt><dd class="font-mono">${esc(f.package)}@${esc(f.version)}</dd></div><div><dt class="text-slate-500">Fixed in</dt><dd class="font-mono">${esc(f.fixed_version || "none known in OSV data")}</dd></div>

@@ -1,5 +1,6 @@
 """Run with:  python3 -m unittest discover -s tests -v      (no extra installs needed)"""
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+logging.disable(logging.CRITICAL)  # tests trigger failures on purpose; keep the output readable
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 _tmp = tempfile.mkdtemp()
@@ -180,6 +182,7 @@ class OSVTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
 
     def setUp(self):
         MockOSV.mode, MockOSV.posts = "ok", []

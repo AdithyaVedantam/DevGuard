@@ -42,6 +42,7 @@ def fetch(url, method="GET", body=None, headers=None, timeout=30, retries=1, max
             return raw
         except urllib.error.HTTPError as e:  # must come before URLError (it is a subclass)
             detail = e.read(500).decode("utf-8", "replace") if hasattr(e, "read") else ""
+            e.close()
             log.warning("HTTP %s from %s: %s", e.code, urllib.parse.urlparse(url).netloc, detail[:200])
             if e.code != 429 and e.code < 500:
                 raise NetError(f"HTTP {e.code}", e.code, detail) from e
