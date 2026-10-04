@@ -5,15 +5,16 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import Depends, FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import db
+import discovery
 import github
 import llm
 import queries
@@ -118,12 +119,47 @@ async def read_upload(upload, label):
         raise AppError(422, "not_text", f"{label} is not a text file.")
 
 
+def project_label(owner_or_root, path):
+    return f"{owner_or_root}/{path}" if path else owner_or_root
+
+
+def import_many(items, source_type, name_for, url_for=None, branch=None, skipped=None, warnings=None):
+    """Scan every item (one npm project each). One broken project never stops the others.
+    items = [{"path", "manifest", "lock"}]; returns the legacy project_id/scan_id (first success)
+    plus a per-project list for the UI."""
+    results, first_error = [], None
+    for item in items:
+        entry = {"path": item["path"], "name": name_for(item)}
+        try:
+            ids = import_and_scan(entry["name"], source_type, item["manifest"], item["lock"],
+                                  url_for(item) if url_for else None, branch)
+            scan = queries.get_scan(ids["scan_id"])
+            entry["name"] = queries.get_project(ids["project_id"])["name"]  # the stored name (may come from package.json)
+            entry.update(ids, status=scan["status"], risk_index=scan["risk_index"], risk_level=scan["risk_level"],
+                         total_findings=scan["total_findings"], critical_count=scan["critical_count"],
+                         total_dependencies=scan["total_dependencies"])
+        except AppError as e:
+            first_error = first_error or e
+            entry["error"] = {"code": e.code, "message": e.message}
+        results.append(entry)
+    ok = [r for r in results if "project_id" in r]
+    if not ok:
+        if len(results) == 1 and first_error:
+            raise first_error  # single project: show the precise error, exactly like before
+        raise AppError(422, "nothing_scanned", f"None of the {len(results)} projects could be scanned.",
+                       first_error.message if first_error else None)
+    return {"project_id": ok[0]["project_id"], "scan_id": ok[0]["scan_id"], "projects": results,
+            "skipped": skipped or [], "warnings": warnings or []}
+
+
 # ---- import / scan ------------------------------------------------------------------------------
 @app.post("/api/import/github", dependencies=[limit("scan", 20)])
 def import_github(body: UrlBody):
-    files = github.fetch_repo_files(body.url)
-    return import_and_scan(f"{files['owner']}/{files['repo']}", "github", files["package_json"], files["package_lock"],
-                           f"https://github.com/{files['owner']}/{files['repo']}", files["branch"])
+    found = github.fetch_repo_projects(body.url)
+    base = f"{found['owner']}/{found['repo']}"
+    return import_many(found["items"], "github", lambda i: project_label(base, i["path"]),
+                       lambda i: github.repo_url_for(found["owner"], found["repo"], found["branch"], i["path"]),
+                       found["branch"], found["skipped"], found["warnings"])
 
 
 @app.post("/api/import/upload", dependencies=[limit("scan", 20)])
@@ -133,6 +169,34 @@ async def import_upload(package_json: UploadFile = File(...), package_lock: Opti
     if not pkg:
         raise AppError(422, "package_json_missing", "package.json is required.")
     return await run_in_threadpool(import_and_scan, None, "upload", pkg, lock)
+
+
+@app.post("/api/import/files", dependencies=[limit("scan", 20)])
+async def import_files(files: List[UploadFile] = File(...), paths: List[str] = Form(...)):
+    """Folder upload: many package.json / package-lock.json files, each with its relative path
+    (e.g. 'my-app/backend/package.json'). Files are paired by folder; paths are only labels."""
+    if len(files) != len(paths):
+        raise AppError(422, "bad_upload", "Every uploaded file needs a matching path.")
+    if len(files) > discovery.MAX_UPLOAD_FILES:
+        raise AppError(422, "too_many_files", f"Please upload at most {discovery.MAX_UPLOAD_FILES} files.",
+                       "Only package.json and package-lock.json files are needed - not the whole folder.")
+    entries = []
+    for upload, path in zip(files, paths):
+        base = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        if base not in (discovery.MANIFEST, discovery.LOCKFILE):
+            continue  # never even read other files
+        text = await read_upload(upload, base)
+        if text is not None:
+            entries.append((path, text))
+    items, skipped, root_label = discovery.group_uploaded(entries)
+    if not items:
+        raise AppError(422, "package_json_missing", "No package.json was found in the selected folder.",
+                       "Choose the project folder (or a parent folder that contains your projects).")
+    items, more_skipped = discovery.apply_limits(items)
+    single = len(items) == 1
+    # one project keeps the old behaviour (named after package.json); several are named by folder
+    name_for = (lambda i: None) if single else (lambda i: project_label(root_label or "upload", i["path"]))
+    return await run_in_threadpool(import_many, items, "upload", name_for, None, None, skipped + more_skipped)
 
 
 @app.post("/api/demo/{variant}", dependencies=[limit("scan", 20)])
@@ -150,10 +214,11 @@ def rescan(project_id: int):
     project = db.query("SELECT * FROM projects WHERE id=?", (project_id,), one=True)
     if project is None:
         raise AppError(404, "project_not_found", "Project not found.")
-    if project["source_type"] == "github" and project["repo_url"]:  # pick up new commits
-        files = github.fetch_repo_files(project["repo_url"])
+    if project["source_type"] == "github" and project["repo_url"]:  # pick up new commits (same folder only)
+        found = github.fetch_repo_projects(project["repo_url"], exact=True)
+        item = found["items"][0]
         db.execute("UPDATE projects SET manifest_text=?, lock_text=?, branch=? WHERE id=?",
-                   (files["package_json"], files["package_lock"], files["branch"], project_id))
+                   (item["manifest"], item["lock"], found["branch"], project_id))
     return {"project_id": project_id, "scan_id": run_scan(project_id)}
 
 

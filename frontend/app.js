@@ -50,15 +50,18 @@ async function homePage() {
     <h1 class="text-4xl font-semibold tracking-tight text-white md:text-5xl">Know what is vulnerable.<br>Know why it matters.<br><span class="text-teal-400">Track whether you are getting safer.</span></h1>
     <p class="mx-auto mt-5 max-w-2xl text-slate-400">DevGuard reads your npm dependency tree, checks every resolved version against the OSV vulnerability database, and shows risk metrics and trends over time.</p>
   </section>
-  <div id="busy" class="mb-4"></div><div id="error" class="mb-4"></div>
+  <div id="busy" class="mb-4"></div><div id="error" class="mb-4"></div><div id="imported" class="mb-4"></div>
   <div class="grid gap-5 md:grid-cols-2">
     <div class="card"><h2 class="font-semibold text-white">Analyze a public GitHub repository</h2>
-      <p class="mt-1 text-xs text-slate-500">Reads package.json and package-lock.json from the repo root. Nothing is cloned or run.</p>
+      <p class="mt-1 text-xs text-slate-500">Finds every package.json in the repository (backend/, frontend/, monorepo packages) and scans each one. To scan one folder only, paste its folder URL. Nothing is cloned or run.</p>
       <input id="ghUrl" class="input mt-4" placeholder="https://github.com/user/repository">
       <button id="ghBtn" class="btn btn-primary mt-3 w-full">Analyze Repository</button></div>
     <div class="card"><h2 class="font-semibold text-white">Upload project files</h2>
       <p class="mt-1 text-xs text-slate-500">DevGuard only analyzes dependency metadata. Uploaded code is never executed.</p>
-      <label class="mt-4 block text-xs text-slate-400">package.json (required)<input id="fPkg" type="file" accept=".json" class="input mt-1"></label>
+      <label class="mt-4 block text-xs text-slate-400">Whole project folder <span class="text-teal-300">(finds every package.json inside; node_modules is skipped)</span><input id="fDir" type="file" webkitdirectory directory multiple class="input mt-1"></label>
+      <div id="dirInfo" class="mt-1 text-xs text-slate-500"></div>
+      <div class="my-3 flex items-center gap-3 text-[11px] uppercase tracking-wide text-slate-600"><span class="h-px flex-1 bg-slate-800"></span>or pick two files<span class="h-px flex-1 bg-slate-800"></span></div>
+      <label class="block text-xs text-slate-400">package.json<input id="fPkg" type="file" accept=".json" class="input mt-1"></label>
       <label class="mt-3 block text-xs text-slate-400">package-lock.json (recommended)<input id="fLock" type="file" accept=".json" class="input mt-1"></label>
       <button id="upBtn" class="btn btn-primary mt-3 w-full">Upload &amp; Analyze</button></div>
   </div>
@@ -72,21 +75,42 @@ async function homePage() {
   <footer class="mt-14 text-center text-xs text-slate-500">Vulnerability data from OSV. DevGuard detects known vulnerabilities only. The Risk Index is a DevGuard heuristic, not an industry standard.</footer>`;
 
   const run = async (msg, fn) => {
-    $("#error").innerHTML = ""; $("#busy").innerHTML = `<div class="card">${spinner(msg)}<p class="mt-2 text-xs text-slate-500">This usually takes a few seconds.</p></div>`;
+    $("#error").innerHTML = ""; $("#imported").innerHTML = ""; $("#busy").innerHTML = `<div class="card">${spinner(msg)}<p class="mt-2 text-xs text-slate-500">This usually takes a few seconds per project.</p></div>`;
     document.querySelectorAll("button").forEach((b) => (b.disabled = true));
-    try { const r = await fn(); location.hash = `#/project/${r.project_id}`; }
+    try {
+      const r = await fn();
+      if (r.projects && r.projects.length > 1) { $("#busy").innerHTML = ""; $("#imported").innerHTML = importSummary(r); document.querySelectorAll("button").forEach((b) => (b.disabled = false)); loadProjects(); $("#imported").scrollIntoView({ behavior: "smooth" }); }
+      else location.hash = `#/project/${r.project_id}`;
+    }
     catch (e) { $("#busy").innerHTML = ""; $("#error").innerHTML = errBox(e); document.querySelectorAll("button").forEach((b) => (b.disabled = false)); }
   };
-  $("#ghBtn").onclick = () => { const url = $("#ghUrl").value.trim(); if (url) run("Downloading files from GitHub and querying OSV…", () => post("/api/import/github", { url })); };
+  $("#ghBtn").onclick = () => { const url = $("#ghUrl").value.trim(); if (url) run("Finding package.json files on GitHub and querying OSV…", () => post("/api/import/github", { url })); };
   $("#ghUrl").onkeydown = (e) => { if (e.key === "Enter") $("#ghBtn").click(); };
+  // A folder pick lists EVERY file (even node_modules), so keep only the two file names we need.
+  const pickedManifests = () => [...($("#fDir").files || [])].filter((f) => /^(package\.json|package-lock\.json)$/.test(f.name) && !/(^|\/)node_modules\//.test(f.webkitRelativePath || ""));
+  $("#fDir").onchange = () => {
+    const found = pickedManifests(), n = found.filter((f) => f.name === "package.json").length;
+    $("#dirInfo").textContent = n ? `Found ${n} package.json file${n > 1 ? "s" : ""} (${found.length - n} lockfile${found.length - n === 1 ? "" : "s"}).` : ($("#fDir").files.length ? "No package.json found in that folder." : "");
+  };
   $("#upBtn").onclick = () => {
+    const picked = pickedManifests();
+    if (picked.length) {
+      if (!picked.some((f) => f.name === "package.json")) { $("#error").innerHTML = errBox({ message: "No package.json was found in the selected folder." }); return; }
+      const fd = new FormData();
+      picked.forEach((f) => { fd.append("files", f); fd.append("paths", f.webkitRelativePath || f.name); });
+      return run("Reading package files and querying OSV…", () => api("/api/import/files", { method: "POST", body: fd }));
+    }
     const pkg = $("#fPkg").files[0], lock = $("#fLock").files[0];
-    if (!pkg) { $("#error").innerHTML = errBox({ message: "Please choose a package.json file." }); return; }
+    if (!pkg) { $("#error").innerHTML = errBox({ message: "Please choose a project folder, or a package.json file." }); return; }
     const fd = new FormData(); fd.append("package_json", pkg); if (lock) fd.append("package_lock", lock);
     run("Parsing dependencies and querying OSV…", () => api("/api/import/upload", { method: "POST", body: fd }));
   };
   document.querySelectorAll("[data-demo]").forEach((b) => (b.onclick = () => run("Scanning demo project against OSV…", () => post(`/api/demo/${b.dataset.demo}`))));
 
+  loadProjects();
+}
+
+async function loadProjects() {
   try {
     const { projects } = await api("/api/projects");
     $("#projects").innerHTML = projects.length ? `<div class="grid gap-3 md:grid-cols-2">${projects.map((p) => {
@@ -95,6 +119,20 @@ async function homePage() {
         <div class="mt-2 flex flex-wrap items-center gap-4 text-xs text-slate-400">${s ? `<span>Risk <b class="text-slate-100">${s.risk_index}</b></span><span>${s.total_findings} vulns</span>${s.critical_count ? badge("critical") : ""}${s.status !== "completed" ? `<span class="pill text-orange-300">${esc(s.status)}</span>` : ""}<span class="ml-auto">${when(s.created_at)} · ${p.scan_count} scans</span>` : "No scans yet"}</div></a>`;
     }).join("")}</div>` : empty("No projects yet.", "Analyze a public GitHub repository or upload your package files to get started.");
   } catch (e) { $("#projects").innerHTML = errBox(e); }
+}
+
+// Shown after one import created several projects (backend + frontend, monorepo, ...).
+function importSummary(r) {
+  const ok = r.projects.filter((p) => p.project_id), bad = r.projects.filter((p) => p.error);
+  const row = (p) => p.project_id
+    ? `<a href="#/project/${p.project_id}" class="flex flex-wrap items-center gap-3 rounded-lg border border-slate-800 px-4 py-3 text-sm transition hover:border-teal-400/50"><b class="text-white">${esc(p.name)}</b><span class="pill">${esc(p.path || "root folder")}</span>
+        <span class="text-xs text-slate-400">${p.total_dependencies} packages</span><span class="text-xs text-slate-400">Risk <b style="color:${riskColor(p.risk_level)}">${p.risk_index}</b></span><span class="text-xs text-slate-400">${p.total_findings} vulns</span>${p.critical_count ? badge("critical") : ""}${p.status !== "completed" ? `<span class="pill text-orange-300">${esc(p.status)}</span>` : ""}<span class="ml-auto text-xs text-teal-400">Open →</span></a>`
+    : `<div class="flex flex-wrap items-center gap-3 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3 text-sm"><b class="text-white">${esc(p.name)}</b><span class="pill">${esc(p.path || "root folder")}</span><span class="text-xs text-red-300">${esc(p.error.message)}</span></div>`;
+  const notes = [...(r.skipped || []).map((x) => `${x.path || "."}: ${x.reason}`), ...(r.warnings || [])];
+  return `<div class="card"><h2 class="font-semibold text-white">Found ${r.projects.length} npm projects — ${ok.length} scanned${bad.length ? `, ${bad.length} failed` : ""}</h2>
+    <p class="mb-3 mt-1 text-xs text-slate-500">Each folder with its own package.json is its own project, with its own dashboard, history and comparison.</p>
+    <div class="grid gap-2">${r.projects.map(row).join("")}</div>
+    ${notes.length ? `<ul class="mt-3 list-disc pl-5 text-xs text-slate-500">${notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}</div>`;
 }
 
 // ---------- project page ----------
