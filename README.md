@@ -101,7 +101,7 @@ npm projects only (lockfile v2/v3, files at the repo root) · public GitHub repo
 Post a scan summary to Slack/Discord via webhook · scheduled re-scans · GitHub Action that runs a scan on every push · Python/`requirements.txt` support · swap SQLite for PostgreSQL.
 
 ## 10. Live demo & deployment
-Live: _paste your https://….onrender.com link here_ (free tier: first load takes about a minute, and data resets when the service restarts — click **Load demo** first).
+Live: https://devguard-muh3.onrender.com/ (free tier: first load takes about a minute, and data resets when the service restarts — click **Load demo** first).
 
 Deploy on Render (Python web service): Build `pip install -r requirements.txt`, Start `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'`, and set `DEVGUARD_PUBLIC=1`, `PYTHON_VERSION`, and optionally `LLM_API_KEY`, `LLM_MODEL`, `LLM_FALLBACK_MODELS`, `GITHUB_TOKEN`. A ready-made `render.yaml` is included.
 
