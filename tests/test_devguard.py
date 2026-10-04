@@ -328,45 +328,109 @@ class PipelineTests(unittest.TestCase):
 
 # ---------------------------------------------------------------- AI + GitHub
 class AITests(unittest.TestCase):
+    ENV = ("LLM_API_KEY", "LLM_MODEL", "LLM_FALLBACK_MODELS", "ALT_API_KEY", "ALT_BASE_URL", "ALT_MODELS")
+
     def setUp(self):
         if os.path.exists(db.db_path()):
             os.remove(db.db_path())
         db.init_db()
         scanner._CACHE.clear()
+        self.orig = llm.fetch_json
+        for k in self.ENV:
+            os.environ.pop(k, None)
         self.sid = scanner.run_scan(make_project("before"), FakeOSV())
 
     def tearDown(self):
-        os.environ.pop("LLM_API_KEY", None)
+        llm.fetch_json = self.orig
+        for k in self.ENV:
+            os.environ.pop(k, None)
 
-    def test_without_key_uses_rule_based(self):
+    def test_without_key_uses_rules_and_hides_config_hints(self):
         r = llm.explain(self.sid)
-        self.assertEqual(r["source"], "rule-based")
+        self.assertEqual(r["source"], "rules")
         self.assertIn("4 known vulnerabilities", r["text"])
+        self.assertNotIn("LLM_API_KEY", json.dumps(r))
         with self.assertRaises(AppError) as cm:
             llm.ask(self.sid, "what first?")
-        self.assertEqual(cm.exception.code, "ai_not_configured")
+        self.assertEqual(cm.exception.code, "ai_disabled")
+        self.assertNotIn("LLM", cm.exception.message + (cm.exception.hint or ""))
 
     def test_context_contains_only_calculated_facts(self):
         ctx = llm.build_context(self.sid)
         self.assertEqual(ctx["vulnerabilities"], 4)
-        self.assertEqual(ctx["top_findings"][0]["advisory"] in ("T-1", "T-2", "T-3"), True)
+        self.assertIn(ctx["top_findings"][0]["advisory"], ("T-1", "T-2", "T-3"))
 
-    def test_ai_success_and_fallback(self):
-        os.environ["LLM_API_KEY"] = "k"
-        original = llm.fetch_json
+    def test_gemini_model_fallback_order(self):
+        os.environ.update(LLM_API_KEY="k", LLM_MODEL="m1", LLM_FALLBACK_MODELS="m2,m3")
+        tried = []
+
+        def fake(url, **kw):
+            model = url.split("/models/")[1].split(":")[0]
+            tried.append(model)
+            if model != "m3":
+                raise llm.NetError("HTTP 404", 404)
+            return {"candidates": [{"content": {"parts": [{"text": "ok from m3"}]}}]}
+        llm.fetch_json = fake
+        self.assertEqual(llm.explain(self.sid), {"text": "ok from m3", "source": "ai"})
+        self.assertEqual(tried, ["m1", "m2", "m3"])
+
+    def test_alt_provider_used_when_gemini_fails(self):
+        os.environ.update(LLM_API_KEY="k", LLM_MODEL="g1", LLM_FALLBACK_MODELS="g2", ALT_API_KEY="a",
+                          ALT_BASE_URL="https://alt.test/v1", ALT_MODELS="alt-1")
+
+        def fake(url, **kw):
+            if "generativelanguage" in url:
+                raise llm.NetError("HTTP 429", 429)
+            self.assertTrue(url.endswith("/chat/completions"))
+            return {"choices": [{"message": {"content": "from alt"}}]}
+        llm.fetch_json = fake
+        self.assertEqual(llm.ask(self.sid, "what first?")["text"], "from alt")
+
+    def test_all_models_fail_is_quiet_and_generic(self):
+        os.environ.update(LLM_API_KEY="k")
+
+        def boom(*a, **k):
+            raise llm.NetError("HTTP 403 secret-detail", 403)
+        llm.fetch_json = boom
+        self.assertEqual(llm.explain(self.sid)["source"], "rules")
+        with self.assertRaises(AppError) as cm:
+            llm.ask(self.sid, "what first?")
+        self.assertEqual(cm.exception.code, "ai_unavailable")
+        self.assertNotIn("secret-detail", cm.exception.message)
+
+
+class SafetyTests(unittest.TestCase):
+    def test_rate_limit_only_in_public_mode(self):
+        import ratelimit
+        os.environ.pop("DEVGUARD_PUBLIC", None)
+        for _ in range(5):
+            ratelimit.check("1.1.1.1", "t", 1)  # unlimited locally
+        os.environ["DEVGUARD_PUBLIC"] = "1"
         try:
-            llm.fetch_json = lambda *a, **k: {"candidates": [{"content": {"parts": [{"text": "Fix minimist first."}]}}]}
-            self.assertEqual(llm.explain(self.sid), {"text": "Fix minimist first.", "source": "ai", "note": None})
-            self.assertEqual(llm.ask(self.sid, "what first?")["text"], "Fix minimist first.")
-
-            def boom(*a, **k):
-                raise llm.NetError("HTTP 403", 403)
-            llm.fetch_json = boom
-            r = llm.explain(self.sid)
-            self.assertEqual(r["source"], "rule-based")
-            self.assertIn("AI unavailable", r["note"])
+            ratelimit.check("2.2.2.2", "t", 2)
+            ratelimit.check("2.2.2.2", "t", 2)
+            with self.assertRaises(AppError) as cm:
+                ratelimit.check("2.2.2.2", "t", 2)
+            self.assertEqual(cm.exception.status, 429)
         finally:
-            llm.fetch_json = original
+            os.environ.pop("DEVGUARD_PUBLIC", None)
+
+    def test_scan_failure_hides_internal_details(self):
+        if os.path.exists(db.db_path()):
+            os.remove(db.db_path())
+        db.init_db()
+        scanner._CACHE.clear()
+        pid = make_project("before")
+        original = scanner.analysis.risk_index
+        scanner.analysis.risk_index = lambda x: 1 / 0
+        try:
+            with self.assertRaises(AppError) as cm:
+                scanner.run_scan(pid, FakeOSV())
+        finally:
+            scanner.analysis.risk_index = original
+        self.assertNotIn("division", cm.exception.message + str(cm.exception.hint))
+        failed = db.query("SELECT errors FROM scans WHERE status='failed'", one=True)
+        self.assertNotIn("ZeroDivision", failed["errors"])
 
 
 class ExportTests(unittest.TestCase):

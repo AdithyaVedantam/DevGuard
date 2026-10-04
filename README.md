@@ -34,11 +34,15 @@ Open **http://localhost:8000**. That's it — the database file (`devguard.db`) 
 
 ## 3. Turn on the AI (optional)
 ```bash
-cp .env.example .env        # then paste your Gemini key after LLM_API_KEY=
+cp .env.example .env        # then open .env in VS Code and paste your Gemini key after LLM_API_KEY=
 ```
-Restart the server. The **AI Assistant** tab then answers "what should I fix first?" using only your scan's data. Without a key the app still works (you get a rule-based summary instead).
+Restart the server. The **AI Assistant** tab then answers "what should I fix first?" using only your scan's data. Without a key the app still works and shows an automated summary instead (users are never told about keys or config).
 
-**AI design rule (good interview point):** the AI never decides what is vulnerable — OSV data and our own code do. The AI only *explains* numbers that were already calculated, it is told to use only the data it's given, and if Gemini fails the app falls back to the rule-based text.
+**Resilience:** models are tried in order — your `LLM_MODEL`, then `LLM_FALLBACK_MODELS`, then an optional second provider (`ALT_*`, any OpenAI-compatible API such as xAI Grok, Groq or OpenRouter), then DevGuard's own rule-based summary. A retired model, a rate limit or an outage never breaks the page.
+
+**AI design rule (good interview point):** the AI never decides what is vulnerable — OSV data and our own code do. The AI only *explains* numbers that were already calculated, it is told to use only the data it's given, and treats advisory text as data, not instructions.
+
+**Security notes:** error details, model names and keys go to the server log only. With `DEVGUARD_PUBLIC=1` (set on the hosted site) the API docs are hidden, delete is disabled, and scans/AI calls are rate-limited per IP.
 
 ## 4. How it works
 ```
@@ -56,7 +60,8 @@ GitHub URL / upload  ->  package.json + lockfile  ->  parse into a dependency li
 | `backend/scanner.py` | The scan pipeline, step by step |
 | `backend/queries.py` | The SQL (`GROUP BY` / `JOIN`) behind every number on the dashboard |
 | `backend/db.py` | SQLite tables, written as plain SQL |
-| `backend/llm.py` | All AI code (Gemini) |
+| `backend/llm.py` | All AI code (Gemini + fallback models + optional second provider) |
+| `backend/ratelimit.py` | Per-IP limits on the public site |
 | `backend/github.py` | Downloads the two files from a public repo |
 | `frontend/app.js` | The whole UI |
 
@@ -69,7 +74,7 @@ GitHub URL / upload  ->  package.json + lockfile  ->  parse into a dependency li
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-27 tests, no extra installs, no internet needed (OSV is mocked with a local test server).
+31 tests, no extra installs, no internet needed (OSV is mocked with a local test server).
 
 ## 6. Troubleshooting
 | Problem | Fix |
@@ -86,7 +91,7 @@ npm projects only (lockfile v2/v3, files at the repo root) · public GitHub repo
 
 ## 8. Resume / interview
 - *Built a dependency security analytics tool (Python, FastAPI, SQLite) that parses npm lockfiles into direct/transitive dependency graphs, batch-queries the OSV vulnerability database, and computes severity (own CVSS v3 calculator), a transparent risk index, and scan-to-scan remediation trends.*
-- *Integrated Gemini to explain scan results using only calculated data, with a deterministic fallback; wrote 27 automated tests including a mock OSV server.*
+- *Integrated Gemini to explain scan results using only calculated data, with a deterministic fallback; wrote 31 automated tests including a mock OSV server.*
 - **Pitch:** "A user imports a project from GitHub or uploads package files. Python parses the lockfile to find every package and how it got there, batch-queries OSV, and stores each scan in SQLite. SQL aggregates give severity, exposure and trends, and comparing scans shows what was fixed or introduced. An LLM explains the results but never decides what's vulnerable."
 - **Why SQL / SQLite?** Scans, dependencies and findings are related tables; trends are aggregations. SQLite = zero setup for a prototype.
 - **Why batch?** One request for hundreds of packages instead of one each.
@@ -94,3 +99,11 @@ npm projects only (lockfile v2/v3, files at the repo root) · public GitHub repo
 
 ## 9. Ideas to extend later
 Post a scan summary to Slack/Discord via webhook · scheduled re-scans · GitHub Action that runs a scan on every push · Python/`requirements.txt` support · swap SQLite for PostgreSQL.
+
+## 10. Live demo & deployment
+Live: _paste your https://….onrender.com link here_ (free tier: first load takes about a minute, and data resets when the service restarts — click **Load demo** first).
+
+Deploy on Render (Python web service): Build `pip install -r requirements.txt`, Start `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'`, and set `DEVGUARD_PUBLIC=1`, `PYTHON_VERSION`, and optionally `LLM_API_KEY`, `LLM_MODEL`, `LLM_FALLBACK_MODELS`, `GITHUB_TOKEN`. A ready-made `render.yaml` is included.
+
+## 11. Reading CVSS in the UI
+Severity comes from the CVSS v3 score OSV provides (our own implementation of the FIRST formula). The Vulnerabilities table shows the numeric score; "—" means OSV gave only a label (for example advisories that carry only a newer CVSS v4 vector, which DevGuard does not score).
