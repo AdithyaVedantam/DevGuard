@@ -8,6 +8,7 @@
  6. save      everything is written to SQLite in ONE transaction
 """
 import json
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -17,6 +18,7 @@ from errors import AppError
 from osv import OSVClient
 from npm_parser import analyze_inputs
 
+log = logging.getLogger("devguard")
 SEVERITIES = ["critical", "high", "medium", "low", "unknown"]
 _CACHE = {}  # osv_id -> (fetched_at, record); advisories are reused between scans for 24 h
 CACHE_SECONDS = 24 * 3600
@@ -141,11 +143,12 @@ def run_scan(project_id, osv=None):
              analysis.risk_level(index, total), json.dumps(errors[:50]), scan_id))
         conn.commit()
         return scan_id
-    except Exception as e:  # keep a 'failed' scan row so the problem is visible, then report it
+    except Exception:  # keep a 'failed' scan row so the problem is visible, then report it
+        log.exception("scan failed for project %s", project_id)  # full details only in the server log
         conn.rollback()
         conn.execute("INSERT INTO scans (project_id, status, mode, created_at, errors) VALUES (?, 'failed', ?, ?, ?)",
-                     (project_id, parsed.resolution_mode, now(), json.dumps([f"{type(e).__name__}: {e}"])))
+                     (project_id, parsed.resolution_mode, now(), json.dumps(["Internal error while scanning. Please try again."])))
         conn.commit()
-        raise AppError(500, "scan_failed", "The scan failed unexpectedly.", f"{type(e).__name__}: {e}")
+        raise AppError(500, "scan_failed", "The scan failed unexpectedly. Please try again.")
     finally:
         conn.close()

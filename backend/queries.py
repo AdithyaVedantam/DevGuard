@@ -91,7 +91,7 @@ def _split(scan_id, column):
 def top_packages(scan_id, limit=8):
     return query("""SELECT d.name, d.version, d.dep_type, d.env, COUNT(f.id) AS findings,
                            ROUND(SUM(f.risk), 1) AS risk, SUM(f.severity = 'critical') AS critical,
-                           SUM(f.severity = 'high') AS high
+                           SUM(f.severity = 'high') AS high, MAX(f.cvss) AS max_cvss
                     FROM dependencies d JOIN findings f ON f.dependency_id = d.id
                     WHERE d.scan_id = ? GROUP BY d.id ORDER BY SUM(f.risk) DESC LIMIT ?""", (scan_id, limit))
 
@@ -125,7 +125,8 @@ def summary(project_id):
     usable = query("SELECT id, created_at, risk_index, total_findings, critical_count, high_count FROM scans "
                    "WHERE project_id=? AND status IN ('completed','partial') ORDER BY id", (project_id,))
     prev_id = previous_scan_id(latest) if latest["status"] != "failed" else None
-    return {"project": project, "scan": latest, "trend": usable,
+    max_cvss = query("SELECT MAX(cvss) AS m FROM findings WHERE scan_id=?", (latest["id"],), one=True)["m"]
+    return {"project": project, "scan": latest, "trend": usable, "max_cvss": max_cvss,
             "exposure": _split(latest["id"], "dep_type"), "environment": _split(latest["id"], "env"),
             "top_packages": top_packages(latest["id"]),
             "changes": compare(latest["id"], prev_id) if prev_id else None}

@@ -1,10 +1,14 @@
 """Tiny HTTP helper built on Python's standard library (no `requests` needed).
 Used for OSV, GitHub and Gemini. Retries on timeouts / 429 / 5xx."""
 import json
+import logging
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
+log = logging.getLogger("devguard")
 
 
 class NetError(Exception):
@@ -38,13 +42,15 @@ def fetch(url, method="GET", body=None, headers=None, timeout=30, retries=1, max
             return raw
         except urllib.error.HTTPError as e:  # must come before URLError (it is a subclass)
             detail = e.read(500).decode("utf-8", "replace") if hasattr(e, "read") else ""
+            log.warning("HTTP %s from %s: %s", e.code, urllib.parse.urlparse(url).netloc, detail[:200])
             if e.code != 429 and e.code < 500:
                 raise NetError(f"HTTP {e.code}", e.code, detail) from e
             last = NetError(f"HTTP {e.code}", e.code, detail)
         except NetError:
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last = NetError(f"network error: {e}")
+            log.warning("network error calling %s: %s", urllib.parse.urlparse(url).netloc, e)
+            last = NetError("network error")  # details stay in the server log, not in user-visible text
         if attempt < retries - 1:
             time.sleep(0.5 * (2 ** attempt))
     raise last

@@ -1,17 +1,24 @@
-"""AI features (Google Gemini). All AI code lives in this one file.
+"""AI features. All AI code lives in this one file.
 
-Design rule: the AI never decides what is vulnerable. DevGuard's normal code does that (OSV data +
-our own maths). The AI only EXPLAINS numbers that were already calculated, and answers questions about
-them. If no API key is set (or Gemini fails), we fall back to a rule-based explanation, so the app
-always works.
+Design rule: the AI never decides what is vulnerable. DevGuard's normal code does that (OSV data + our
+own maths). The AI only EXPLAINS numbers that were already calculated, and answers questions about them.
 
-Same env variable names as NutrAI:  LLM_API_KEY, LLM_MODEL
+Resilience: models are tried in order until one answers:
+   1. Gemini models   (LLM_API_KEY, LLM_MODEL, LLM_FALLBACK_MODELS)
+   2. an optional alternative provider with an OpenAI-compatible API, e.g. xAI Grok, Groq, OpenRouter
+      (ALT_API_KEY, ALT_BASE_URL, ALT_MODELS)
+   3. a rule-based summary written by DevGuard itself - the app never breaks because an AI model is down.
+Users never see keys, model names or provider error details; those go to the server log only.
 """
+import json
+import logging
 import os
 
 import queries
 from errors import AppError
 from net import NetError, fetch_json
+
+log = logging.getLogger("devguard")
 
 SYSTEM = (
     "You are DevGuard's assistant. You explain dependency-security scan results to a student/junior developer. "
@@ -22,34 +29,66 @@ SYSTEM = (
     "results may be incomplete. Be concise and practical. Plain text, no markdown headings."
 )
 
+# Google retires gemini-2.5-* on 2026-10-16, so the defaults are the newer models.
+DEFAULT_GEMINI = ["gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.5-flash", "gemini-2.5-flash-lite"]
+
+
+def _csv(name):
+    return [m.strip() for m in os.environ.get(name, "").split(",") if m.strip()]
+
+
+def gemini_models():
+    first = [os.environ["LLM_MODEL"].strip()] if os.environ.get("LLM_MODEL", "").strip() else []
+    return list(dict.fromkeys(first + (_csv("LLM_FALLBACK_MODELS") or DEFAULT_GEMINI)))
+
+
+def providers():
+    chain = []
+    if os.environ.get("LLM_API_KEY"):
+        chain += [("gemini", m) for m in gemini_models()]
+    if os.environ.get("ALT_API_KEY") and os.environ.get("ALT_BASE_URL"):
+        chain += [("alt", m) for m in _csv("ALT_MODELS")]
+    return chain
+
 
 def configured():
-    return bool(os.environ.get("LLM_API_KEY"))
+    return bool(providers())
 
 
-def _call_gemini(system, user, max_tokens=700):
-    model = os.environ.get("LLM_MODEL") or "gemini-2.5-flash"
+def _gemini(model, system, user, max_tokens):
     gen = {"maxOutputTokens": max_tokens, "temperature": 0.3}
-    if "2.5-flash" in model:
+    if model == "gemini-2.5-flash":
         gen["thinkingConfig"] = {"thinkingBudget": 0}  # otherwise 'thinking' eats the output budget
-    try:
-        data = fetch_json(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", method="POST",
-            headers={"x-goog-api-key": os.environ["LLM_API_KEY"]}, timeout=45, retries=2,
-            body={"systemInstruction": {"parts": [{"text": system}]},
-                  "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": gen})
-    except NetError as e:
-        if e.status in (400, 401, 403):
-            raise AppError(502, "ai_rejected", f"Google AI rejected the request ({e.status}).",
-                           "Check LLM_API_KEY and LLM_MODEL in your .env file.")
-        if e.status == 429:
-            raise AppError(429, "ai_rate_limit", "Google AI rate limit reached. Wait a minute and try again.")
-        raise AppError(502, "ai_unreachable", f"Could not get an answer from Google AI ({e}).")
+    data = fetch_json(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", method="POST",
+        headers={"x-goog-api-key": os.environ["LLM_API_KEY"]}, timeout=45, retries=1,
+        body={"systemInstruction": {"parts": [{"text": system}]},
+              "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": gen})
     parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
-    text = "".join(p.get("text", "") for p in parts).strip()
-    if not text:
-        raise AppError(502, "ai_empty", "The AI returned an empty answer. Please try again.")
-    return text
+    return "".join(p.get("text", "") for p in parts)
+
+
+def _alt(model, system, user, max_tokens):
+    base = os.environ["ALT_BASE_URL"].rstrip("/")
+    data = fetch_json(
+        f"{base}/chat/completions", method="POST", headers={"Authorization": f"Bearer {os.environ['ALT_API_KEY']}"},
+        timeout=45, retries=1,
+        body={"model": model, "max_tokens": max_tokens, "temperature": 0.3,
+              "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+    return data["choices"][0]["message"]["content"] or ""
+
+
+def generate(system, user, max_tokens=1500):
+    """Try every configured model in order. Details of failures go to the log, never to the user."""
+    for provider, model in providers():
+        try:
+            text = (_gemini if provider == "gemini" else _alt)(model, system, user, max_tokens).strip()
+            if text:
+                return text
+            log.warning("AI model %s/%s returned an empty answer", provider, model)
+        except (NetError, KeyError, IndexError, TypeError, AttributeError) as e:
+            log.warning("AI model %s/%s failed: %s", provider, model, e)
+    raise AppError(503, "ai_unavailable", "The AI assistant is temporarily unavailable. Please try again later.")
 
 
 def build_context(scan_id):
@@ -93,15 +132,14 @@ def rule_based_explanation(ctx):
 
 def explain(scan_id):
     ctx = build_context(scan_id)
-    if not configured():
-        return {"text": rule_based_explanation(ctx), "source": "rule-based",
-                "note": "Add LLM_API_KEY to .env to get AI explanations."}
-    try:
-        text = _call_gemini(SYSTEM, "Explain this scan result in 4-6 sentences: what matters most and what to fix "
-                            "first. Data:\n" + _json(ctx))
-        return {"text": text, "source": "ai", "note": None}
-    except AppError as e:  # AI problems must never break the app
-        return {"text": rule_based_explanation(ctx), "source": "rule-based", "note": f"AI unavailable: {e.message}"}
+    if configured():
+        try:
+            text = generate(SYSTEM, "Explain this scan result in 4-6 sentences: what matters most and what to fix "
+                            "first. Data:\n" + json.dumps(ctx, indent=1))
+            return {"text": text, "source": "ai"}
+        except AppError:
+            pass  # every model failed -> quietly use the rule-based text
+    return {"text": rule_based_explanation(ctx), "source": "rules"}
 
 
 def ask(scan_id, question):
@@ -109,13 +147,7 @@ def ask(scan_id, question):
     if not question:
         raise AppError(422, "empty_question", "Please type a question.")
     if not configured():
-        raise AppError(503, "ai_not_configured", "AI is not configured yet.",
-                       "Add LLM_API_KEY to your .env file and restart the server.")
+        raise AppError(503, "ai_disabled", "The AI assistant is not enabled on this server.")
     ctx = build_context(scan_id)
-    text = _call_gemini(SYSTEM, f"Scan data:\n{_json(ctx)}\n\nUser question: {question}")
+    text = generate(SYSTEM, f"Scan data:\n{json.dumps(ctx, indent=1)}\n\nUser question: {question}")
     return {"text": text, "source": "ai"}
-
-
-def _json(obj):
-    import json
-    return json.dumps(obj, indent=1)
